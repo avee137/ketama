@@ -39,8 +39,26 @@ if test "$PHP_KETAMA" != "no"; then
   ],[
     AC_MSG_ERROR([wrong ketama lib version or lib not found])
   ],[
-    -L$KETAMA_DIR/lib -lm -ldl
+    -L$KETAMA_DIR/lib -lm
   ])
+  AC_CANONICAL_HOST
+  case "${host}" in
+    *-*-freebsd*)
+      ;;
+    *-*-linux*)
+      LDFLAGS+=" -ldl"
+      ;;
+    *-*-darwin*)
+      LDFLAGS+=" -ldl"
+      ;;
+    *-*-solaris2*)
+      LDFLAGS+=" -ldl"
+      ;;
+    *)
+      AC_MSG_RESULT([Default case for: ${host}, assuming defaults known to work on linux, mac, solaris])
+      LDFLAGS="$LDFLAGS -ldl"
+      ;;
+  esac
 
   PHP_SUBST(KETAMA_SHARED_LIBADD)
 

@@ -5,10 +5,10 @@ OBJNAME = lketama.o
 LIBNAME = ketama.so
 
 OMIT_FRAME_POINTER = -fomit-frame-pointer
-CFLAGS = -I/usr/local/include/ -fPIC -O3 -Wall
+CFLAGS = -I/usr/share/man/man1/ -fPIC -O3 -Wall
 LIBS = lketama
 LFLAGS = -shared $(OMIT_FRAME_POINTER)
-INSTALL_PATH = usr/local/lib/lua/5.1
+INSTALL_PATH = /usr/share/lua
 
 all: $(LIBNAME)
 

@@ -24,10 +24,10 @@
 %% Description: Starts the server
 %%--------------------------------------------------------------------
 start_link() ->
-    start_link("/web/site/GLOBAL/ketama.servers").
+    start_link("../ketama.two.servers").
 
 start_link(ServersFile) ->
-    start_link(ServersFile, "/usr/bin/ketama_erlang_driver").
+    start_link(ServersFile, "./ketama_erlang_driver").
 
 start_link(ServersFile, BinPath) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [ServersFile, BinPath], []).

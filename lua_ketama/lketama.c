@@ -23,7 +23,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #include <ketama.h>
 #define LIB_NAME "ketama"
 #define MT_NAME "KETAMA_MT"
-
+#define ENABLE_FNV_HASH
 
 typedef struct{
 	ketama_continuum *cont;
@@ -121,6 +121,9 @@ lketama_hashi(lua_State *L){
 	return 1;
 }
 
+
+//md5 encoding
+#if !defined(ENABLE_FNV_HASH)
 static int
 lketama_md5digest(lua_State *L){
 	const char *str = luaL_checkstring(L, 2);
@@ -129,17 +132,82 @@ lketama_md5digest(lua_State *L){
 	lua_pushfstring(L, "%p", md5pword);
 	return 1;
 }
+#endif
+
+//fnv1a_32 encoding
+#if defined(ENABLE_FNV_HASH)
+static int
+lketama_fnv1a32digest(lua_State *L){
+          const char *str = luaL_checkstring(L, 2);
+	  int hval = ketama_hashi((char*)str);         
+          lua_pushfstring(L, "%d", hval);
+        return 1;
+}
+#endif
+
+static int
+lketama_info(lua_State *L){
+        ketama_continuum *cont = lketama_get(L, 1);
+
+	if(cont){
+      		lua_pushstring(L, ketama_info((ketama_continuum)cont));
+  	}
+
+	FILE *f = fopen("../lua_test.out", "w");
+	char node_names[1000];
+	sprintf(node_names, "%s", "node1:1000,node2:1000,node3:1000,node4:1000");
+  	sync_servers(node_names, (ketama_continuum)cont );
+	int i=0;
+  	for ( i = 0; i < 100; i++ )
+  	{
+		char k[10];
+        	char output[20];
+		snprintf(k, sizeof(k), "%s%i", "aab", i);
+        	mcs* m = ketama_get_server(k, (ketama_continuum)cont );
+        	sprintf(output, "%s - %s\n", m->ip, k );
+        	fputs(output, f);
+  	}
+	fclose(f);
+	printf("output file saved\n");
+        return 1;
+}
+
+
 
 static luaL_reg pfuncs[] = { {"roll", lketama_roll}, {NULL, NULL} };
+#if !defined(ENABLE_FNV_HASH)
 static luaL_reg mmethods[] = {
 	{"smoke",				lketama_smoke},
-	{"get_server",			lketama_get_server},
-	{"print_continuum",	lketama_print_continuum},
+	{"get_server",				lketama_get_server},
+	{"print_continuum",			lketama_print_continuum},
 	{"compare",				lketama_compare},
 	{"hashi",				lketama_hashi},
-	{"md5digest",			lketama_md5digest},
-	{NULL,					NULL}
+	{"md5digest",				lketama_md5digest},
+	{"ketama_info",				lketama_info},
+	{NULL,					NULL},
 };
+#endif
+
+
+#if defined(ENABLE_FNV_HASH)
+static luaL_reg mmethods[] = {
+        {"smoke",                               lketama_smoke},
+        {"get_server",                          lketama_get_server},
+        {"print_continuum",                     lketama_print_continuum},
+        {"compare",                             lketama_compare},
+        {"hashi",                               lketama_hashi},
+        {"fnv1a32digest",                       lketama_fnv1a32digest},
+        {"ketama_info",                         lketama_info},
+        {NULL,                                  NULL},
+};
+#endif
+
+
+
+
+
+
+
 
 #define register_constant(s) lua_pushinteger(L,s); lua_setfield(L, -2, #s);
 int luaopen_ketama(lua_State *L){

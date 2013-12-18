@@ -16,7 +16,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 local ketama = require 'ketama'
 
-local ket = ketama.roll('../ketama.servers')
+local ket = ketama.roll('../ketama.two.servers')
 --ket:print_continuum() --don't like!
 
 local function compare(ket, a, b)
@@ -27,10 +27,11 @@ local function compare(ket, a, b)
 	else return b end
 end
 
-print("server for 'foo':", ket:get_server('foo'))
-print("greater of 'foo' and 'bar':", compare(ket, 'foo', 'bar'))
-print("hashi of 'foo':", ket:hashi('foo'))
-print("md5 of 'foo':", ket:md5digest('foo'))
+print("server for 'test':", ket:get_server('test'))
+--print("greater of 'foo' and 'bar':", compare(ket, 'foo', 'bar'))
+--print("hashi of 'test':", ket:hashi('test'))
+--print("fnv1a_32 of '1':", ket:fnv1a32digest("1"))
+print("info",ket:ketama_info("test"))
 
 ket:smoke()
 print("closed")

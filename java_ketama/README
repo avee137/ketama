@@ -1,3 +1,23 @@
-I've just nicked the SockIOPool class from our java memcached library, i think
-all the requisite changes for the ketama stuff are contained within.
-It's easy with java collections anyway :)
+This Ketama library has been generalized so it can be used with a cluster of servers of any type.
+
+The LICENSE in this directory applies to the java port only.
+
+WARNING: This library has not been used in a production environment.
+
+To use, add the maven dependency to your project's pom.xml:
+
+<dependency>
+    <groupId>com.wayfair</groupId>
+    <artifactId>commons-hash</artifactId>
+    <version>0.5</version>
+</dependency>
+
+Instantiate a new KetamaRing, and add your servers:
+
+KetamaRing ring = new KetamaRing(new FNV1AServerHashStrategy(), new FNV1A32HashFunction());
+ring.add(new KetamaServer("node1", "127.0.0.1", 11211));
+ring.add(new KetamaServer("node2", "127.0.0.1", 11212));
+ring.add(new KetamaServer("node3", "127.0.0.1", 11213));
+
+It will now map keys to servers:
+KetamaServer server = ring.get("iamakey");

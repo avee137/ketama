@@ -28,6 +28,8 @@
 #include "php_ketama.h"
 #include "ketama.h"
 
+#define PHP_KETAMA_VERSION "0.1.8"
+
 /* If you declare any globals in php_ketama.h uncomment this:
 ZEND_DECLARE_MODULE_GLOBALS(ketama)
 */
@@ -38,7 +40,7 @@ static int le_ketama_continuum;
 
 static void ketama_continuum_dtor( zend_rsrc_list_entry *rsrc TSRMLS_DC )
 {
-	ketama_continuum continuum = (ketama_continuum)rsrc->ptr;
+	ketama_continuum continuum = (ketama_continuum) rsrc->ptr;
 	ketama_smoke( continuum );
 }
 
@@ -50,7 +52,12 @@ zend_function_entry ketama_functions[] = {
 	PHP_FE(ketama_roll,		        NULL)
 	PHP_FE(ketama_destroy,		    NULL)
 	PHP_FE(ketama_get_server,	    NULL)
+	PHP_FE(ketama_get_server_count,	NULL)
+	PHP_FE(ketama_add_server,	    NULL)
+	PHP_FE(ketama_remove_server,    NULL)
     PHP_FE(ketama_print_continuum,  NULL)
+    PHP_FE(ketama_get_info,  	    NULL)
+    PHP_FE(ketama_sync_servers,     NULL)
     PHP_FE(ketama_error,            NULL)
 	{NULL, NULL, NULL}	/* Must be the last line in ketama_functions[] */
 };
@@ -70,7 +77,7 @@ zend_module_entry ketama_module_entry = {
 	PHP_RSHUTDOWN(ketama),	/* Replace with NULL if there's nothing to do at request end */
 	PHP_MINFO(ketama),
 #if ZEND_MODULE_API_NO >= 20010901
-	"0.1", /* Replace with version number for your extension */
+	PHP_KETAMA_VERSION, /* Replace with version number for your extension */
 #endif
 	STANDARD_MODULE_PROPERTIES
 };
@@ -150,6 +157,7 @@ PHP_MINFO_FUNCTION(ketama)
 {
 	php_info_print_table_start();
 	php_info_print_table_header(2, "ketama support", "enabled");
+	php_info_print_table_row(2, "Ketama Version", PHP_KETAMA_VERSION);
 	php_info_print_table_end();
 
 	/* Remove comments if you have entries in php.ini
@@ -226,6 +234,41 @@ PHP_FUNCTION(ketama_error)
 }
 /* }}} */
 
+/* {{{ proto resource ketama_get_info(resource $continuum)
+   Returns information about a ketama continuum*/
+PHP_FUNCTION(ketama_get_info)
+{
+   ketama_continuum cont;
+   zval *zcontinuum;
+
+   if ( zend_parse_parameters( ZEND_NUM_ARGS() TSRMLS_CC, "r", &zcontinuum ) == FAILURE ) {
+        return;
+   }
+
+   ZEND_FETCH_RESOURCE( cont, ketama_continuum, &zcontinuum, -1, "ketama continuum", le_ketama_continuum );
+   RETURN_STRING( (char *)ketama_info(cont), 1);
+   
+}
+/* }}} */
+
+/* {{{ proto  resource ketama_sync_servers(string $servers, resource $continuum)
+   Returns 0 or 1 for failure or success*/
+PHP_FUNCTION(ketama_sync_servers)
+{
+   ketama_continuum cont;
+   zval *zcontinuum;
+   char *servers;
+   long servers_len;
+
+   if ( zend_parse_parameters( ZEND_NUM_ARGS() TSRMLS_CC, "sr", &servers, &servers_len, &zcontinuum ) == FAILURE ) {
+        return;
+   }
+
+   ZEND_FETCH_RESOURCE( cont, ketama_continuum, &zcontinuum, -1, "ketama continuum", le_ketama_continuum );
+   RETURN_LONG( (long)sync_servers(servers, cont));
+}
+
+/* }}} */
 
 /* {{{ proto resource ketama_get_server(string $key, resource $continuum)
    Finds a server for the given key in the continuum */
@@ -247,7 +290,77 @@ PHP_FUNCTION(ketama_get_server)
 
 	array_init( return_value );
 	add_assoc_long( return_value, "point", server->point );
-	add_assoc_string( return_value, "ip", server->ip, 1 );
+	add_assoc_string( return_value, "name", server->ip, 1 );
+}
+/* }}} */
+
+
+/* {{{ proto resource ketama_get_server_count(resource $continuum)
+   Finds a server for the given key in the continuum */
+PHP_FUNCTION(ketama_get_server_count)
+{
+	zval *zcontinuum;
+	ketama_continuum continuum;
+	int numservers;
+
+	if ( zend_parse_parameters( ZEND_NUM_ARGS() TSRMLS_CC, "r", &zcontinuum ) == FAILURE )
+	{
+		return;
+	}
+
+	ZEND_FETCH_RESOURCE( continuum, ketama_continuum, &zcontinuum, -1, "ketama continuum", le_ketama_continuum );
+
+	numservers = ketama_get_server_count( continuum );
+
+	if (numservers == -1) {
+		php_error_docref(NULL TSRMLS_CC, E_ERROR, "unable to get the server count");
+	}
+
+	RETURN_LONG( (long) numservers );
+}
+/* }}} */
+
+/* {{{ proto void ketama_add_server(string $address, int $memory, resource $continuum)
+   Adds a server to the ring */
+PHP_FUNCTION(ketama_add_server)
+{
+	zval *zcontinuum;
+	ketama_continuum continuum;
+	char *address;
+	long address_len;
+	unsigned long memory;
+
+	if ( zend_parse_parameters( ZEND_NUM_ARGS() TSRMLS_CC, "slr", &address, &address_len, &memory, &zcontinuum ) == FAILURE )
+	{
+		return;
+	}
+
+	ZEND_FETCH_RESOURCE( continuum, ketama_continuum, &zcontinuum, -1, "ketama continuum", le_ketama_continuum );
+	if (!ketama_add_server( address, memory, continuum )) {
+		php_error_docref(NULL TSRMLS_CC, E_ERROR, "unable to add a server to the Ketama continuum");
+	}
+}
+/* }}} */
+
+
+/* {{{ proto void ketama_remove_server(string $address, resource $continuum)
+   Removes a server from the ring */
+PHP_FUNCTION(ketama_remove_server)
+{
+	zval *zcontinuum;
+	ketama_continuum continuum;
+	char *address;
+	long address_len;
+
+	if ( zend_parse_parameters( ZEND_NUM_ARGS() TSRMLS_CC, "sr", &address, &address_len, &zcontinuum ) == FAILURE )
+	{
+		return;
+	}
+
+	ZEND_FETCH_RESOURCE( continuum, ketama_continuum, &zcontinuum, -1, "ketama continuum", le_ketama_continuum );
+	if (!ketama_remove_server( address, continuum )) {
+		php_error_docref(NULL TSRMLS_CC, E_ERROR, "unable to remove a server from the Ketama continuum");
+	}
 }
 /* }}} */
 

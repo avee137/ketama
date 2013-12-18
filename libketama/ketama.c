@@ -27,7 +27,13 @@
 */
 
 #include "ketama.h"
+#include "ketama_config.h"
+
+#if defined(ENABLE_FNV_HASH)
+#include "fnv.h"
+#else
 #include "md5.h"
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -38,90 +44,181 @@
 #include <math.h>           /* floor & floorf                       */
 #include <sys/stat.h>       /* various type definitions             */
 #include <sys/shm.h>        /* shared memory functions and structs  */
-#ifdef DEBUG
 #include <syslog.h>
-#endif
+
+#define HASH_COUNT POINTS_PER_SERVER / POINTS_PER_HASH
 
 
 char k_error[255] = "";
+//buffer to store ketama info
+char k_info[
+	sizeof(serverinfo) * MAX_SERVERS +
+	sizeof(char) * 22 * MAX_SERVERS + //extra space for json keys and encoding of servers 
+	sizeof(time_t) * 2 * 3 +
+	sizeof(char)*PATH_MAX + 
+	sizeof(int) * 2 * 3 + //space for ints 
+	sizeof(unsigned long) * 3] = "";
 
 int num_sem_ids = 0;
-int num_shm_ids = 0;
-int num_data = 0;
-int sem_ids_size = 1024;
-int shm_ids_size = 1024;
-int shm_data_size = 1024;
-int *sem_ids = NULL;
-int *shm_ids = NULL;
-int **shm_data = NULL;
+int sem_ids_size = 10;
+int* sem_ids = NULL;
+
+int num_resources = 0;
+int shm_resources_size = 10;
+continuum_resource* shm_resources = NULL;
+
+static void syslog1(int lev, char *msg)
+{
+  syslog(lev, "%s", msg);
+}
+
+static void fatal_exit()
+{
+  exit(1);
+}
+
+static void
+init_shm_resource_tracker() {
+    shm_resources = (continuum_resource*) malloc( sizeof(continuum_resource) * shm_resources_size );
+    if (shm_resources == NULL) {
+        syslog1( LOG_INFO, "Ketama: Cannot malloc shm resource tracker.\n" );
+        fatal_exit();
+    }
+}
+
+static void
+track_shm_resource(continuum_resource resource) {
+    int i, indx = -1;
+
+    // find the resource and update it
+    for (i = 0; i < num_resources; i++) {
+        if (shm_resources[i].key == resource.key) {
+            indx = i;
+            shm_resources[i].data = resource.data;
+            shm_resources[i].shmid = resource.shmid;
+        }
+    }
+
+    // if we didn't find it, create a new one
+    if (indx == -1) {
+        if (num_resources == shm_resources_size) {
+            shm_resources = (continuum_resource*) realloc( shm_resources, sizeof(continuum_resource) * shm_resources_size * 2 );
+            if (shm_resources == NULL) {
+                syslog1( LOG_INFO, "Ketama: Cannot realloc shm resource tracker.\n" );
+                fatal_exit();
+            }
+
+            shm_resources_size *= 2;
+        }
+
+        shm_resources[num_resources] = resource;
+        num_resources++;
+    }
+}
+
+/** \brief Retrieves an existing or new resource.
+  * \param key Key used to attach to shared memory segment.
+  * \param cont Pointer to the continuum resource that will be filled with the location of a valid resource.
+  * \return 1 on success, 0 for failure */
+static int
+get_shm_resource(key_t key, ketama_continuum cont) {
+    int shmid, i, indx = -1;
+
+    // find the resource
+    for (i = 0; i < num_resources; i++) {
+        if (shm_resources[i].key == key) {
+            // if the continuum pointer is invalid don't count this as a found resource
+            if (shm_resources[i].data != NULL) {
+                indx = i;
+            }
+        }
+    }
+
+    // send back the existing resource if it exists
+    if (indx != -1) {
+        *cont = shm_resources[indx];
+        return 1;
+    }
+
+    // attempt to obtain the shared memory ID assigned to this key, and create a segment if it doesn't exist
+    shmid = shmget( key, MC_SHMSIZE, 0644 | IPC_CREAT );
+    if ( shmid == -1 ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: get_shm_resource failed to get valid shared memory segment with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error );
+        cont = NULL;
+        return 0;
+    }
+
+    // attempt to create an attachment to the shared memory segment
+    cont->data = (continuum*) shmat( shmid, (void *)0, SHM_RDONLY );
+    if ( cont->data == (void *)(-1) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: get_shm_resource failed to attach read-only shared memory segment with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error  );
+        cont = NULL;
+        return 0;
+    }
+    cont->shmid = shmid;
+    cont->key = key;
+
+    return 1;
+}
+
+static int
+ketama_shmdt(void* data)
+{
+    int i, result;
+
+    // reset the tracked resource to dummy values
+    for (i = 0; i < num_resources; i++) {
+        if (shm_resources[i].data == data) {
+            shm_resources[i].data = NULL;
+            shm_resources[i].shmid = -1;
+        }
+    }
+
+#ifdef SOLARIS
+    result = shmdt( (char *) data );
+#else
+    result = shmdt( data );
+#endif
+
+    return result;
+}
 
 static void
 init_sem_id_tracker() {
-    sem_ids = malloc(sizeof(int)*1024);
-}
-
-static void
-init_shm_id_tracker() {
-    shm_ids = malloc(sizeof(int)*1024);
-}
-
-static void
-init_shm_data_tracker() {
-    shm_data = malloc(sizeof(int*)*1024);
-}
-
-static void
-track_shm_data(int *data) {
-    if (num_data == shm_data_size) {
-        void *tmp = realloc(shm_data, sizeof(int*)*(shm_data_size + 1024));
-        if (tmp != NULL) {
-    	    shm_data = tmp;
-        } else {
-            sprintf( k_error, "Cannot realloc shm data tracker");
-            exit(1);
-        }
-
-        shm_data_size += 1024;
+    sem_ids = (int*) malloc( sizeof(int) * sem_ids_size );
+    if (sem_ids == NULL) {
+        syslog1( LOG_INFO, "Ketama: Cannot malloc semaphore tracker.\n" );
+        fatal_exit();
     }
-
-    shm_data[num_data] = data;
-    num_data++;
 }
 
 static void
 track_sem_id(int semid) {
-    if (num_sem_ids == sem_ids_size) {
-    void *tmp = realloc(sem_ids, sizeof(int)*(sem_ids_size + 1024));
-        if (tmp != NULL) {
-            sem_ids = tmp;
-        } else {
-            sprintf( k_error, "Cannot realloc semids");
-            exit(1);
-        }
+    int i, indx = -1;
 
-        sem_ids_size += 1024;
+    // find the semaphore
+    for (i = 0; i < num_sem_ids; i++) {
+        if (sem_ids[i] == semid) {
+            indx = i;
+        }
     }
 
-    sem_ids[num_sem_ids] = semid;
-    num_sem_ids++;
-}
+    if (indx == -1) {
+        if (num_sem_ids == sem_ids_size) {
+            sem_ids = (int*) realloc( sem_ids, sizeof(int) * sem_ids_size * 2 );
+            if (sem_ids == NULL) {
+                syslog1( LOG_INFO, "Ketama: Cannot realloc semids.\n" );
+                fatal_exit();
+            }
 
-static void
-track_shm_id(int shmid) {
-    if (num_shm_ids == shm_ids_size) {
-        void *tmp = realloc(shm_ids, sizeof(int)*(shm_ids_size + 1024));
-        if (tmp != NULL) {
-            shm_ids = tmp;
-        } else {
-            sprintf( k_error, "Cannot realloc shmids");
-            exit(1);
+            sem_ids_size *= 2;
         }
 
-        shm_ids_size += 1024;
+        sem_ids[num_sem_ids] = semid;
+        num_sem_ids++;
     }
-
-    shm_ids[num_shm_ids] = shmid;
-    num_shm_ids++;
 }
 
 /** \brief Locks the semaphore.
@@ -154,35 +251,54 @@ ketama_sem_init( key_t key )
 {
     if (sem_ids == NULL) {
         init_sem_id_tracker();
+        syslog1( LOG_INFO, "Semaphore tracker initiated.\n" );
     }
 
     int sem_set_id;
 
-    sem_set_id = semget( key, 1, 0 );
-	track_sem_id(sem_set_id);
+    sem_set_id = semget( key, 1, IPC_CREAT | 0666 );
 
     if ( sem_set_id == -1 )
     {
-        // create a semaphore set with ID SEM_ID
-        sem_set_id = semget( key, 1, IPC_CREAT | 0666 );
-        track_sem_id(sem_set_id);
-
-		if ( sem_set_id == -1 )
-        {
-            strcpy( k_error, "Could not open semaphore!" );
-            return 0;
-        }
-
-        ketama_sem_unlock( sem_set_id );
+        snprintf( k_error, sizeof(k_error), "Ketama: Could not open semaphore!\n" );
+        syslog1( LOG_INFO, k_error );
+        return 0;
     }
+
+    // track the semaphore if it exists
+    track_sem_id(sem_set_id);
 
     return sem_set_id;
 }
 
+/** \brief Locks the semaphore only after it is unlocked by another process.
+  * \param sem_set_id The semaphore handle that you want to lock. */
+static void
+ketama_sem_safely_lock( int sem_set_id )
+{
+    int sanity = 0;
+    while ( semctl( sem_set_id, 0, GETVAL, 0 ) == 2 )
+    {
+        // wait for the continuum creator to finish, but don't block others
+        usleep( 5 );
+
+        // if we are waiting for > 1 second, take drastic action:
+        if(++sanity > 200000)
+        {
+            usleep( rand()%50000 );
+            ketama_sem_unlock( sem_set_id );
+            break;
+        }
+    }
+
+    ketama_sem_lock( sem_set_id );
+}
+
 
 /* ketama.h does not expose this function */
+#if !defined(ENABLE_FNV_HASH)
 void
-ketama_md5_digest( char* inString, unsigned char md5pword[16] )
+ketama_md5_digest( char* inString, unsigned char *md5pword )
 {
     md5_state_t md5state;
 
@@ -190,6 +306,7 @@ ketama_md5_digest( char* inString, unsigned char md5pword[16] )
     md5_append( &md5state, (unsigned char *)inString, strlen( inString ) );
     md5_finish( &md5state, md5pword );
 }
+#endif
 
 
 /** \brief Retrieve the modification time of a file.
@@ -198,63 +315,71 @@ ketama_md5_digest( char* inString, unsigned char md5pword[16] )
 static time_t
 file_modtime( char* filename )
 {
-    struct tm* clock;
     struct stat attrib;
 
     stat( filename, &attrib );
-    clock = gmtime( &( attrib.st_mtime ) );
 
-    return mktime( clock );
+    return attrib.st_mtime;
+}
+
+/** \brief Retrieve the "unique" key to be used for the shared memory and semaphores
+  * \param filename The full path to the file, or user-defined key of the form key:0x12345678.
+  * \return The key.
+  * \todo Ideally ftok wouldn't be used and instead a heashing function would be used to set the upper
+  *       16bits of the key ro some hash when the key is made from a string and the bottom 16bits when
+  *       the key is made from a path, to prevent key collisions between user-defined keys and paths*/
+static key_t
+get_key( char* filename, time_t* fmodtime )
+{
+    key_t key;
+    if (strncmp(filename, "key:", 4) == 0) {
+        unsigned int key_val = -1;
+        sscanf(filename, "key:%x", &key_val );
+        *fmodtime = 0;
+        key = (key_t) key_val;
+    } else {
+        key = ftok(filename, 'R');
+        *fmodtime = file_modtime( filename );
+    }
+
+    return key;
 }
 
 
+
 /** \brief Retrieve a serverinfo struct for one a sever definition.
-  * \param line The entire server definition in plain-text.
-  * \return A serverinfo struct, parsed from the given definition. */
-static serverinfo
-read_server_line( char* line )
+  * \param line The entire server definition in plain-text. */
+static void
+read_server_line( char* line, serverinfo* server )
 {
     char* delim = "\t ";
-    serverinfo server;
-    server.memory = 0;
+    server->memory = 0;
+    char* saveptr = line;
 
-    char* tok = strtok( line, delim );
-    if ( ( strlen( tok ) - 1 ) < 23 )
-    {
-        char* mem = 0;
-        char* endptr = 0;
+    char* tok = strtok_r( line, delim, &saveptr );
 
-        strncpy( server.addr, tok, strlen( tok ) );
-        server.addr[ strlen( tok ) ] = '\0';
+    char* endptr = NULL;
 
-        tok = strtok( 0, delim );
-        /* We do not check for a NULL return earlier because strtok will
-         * always return at least the first token; hence never return NULL.
-         */
-        if ( tok == 0 )
-        {
-            strcpy( k_error, "Unable to find delimiter" );
-            server.memory = 0;
-        }
-        else
-        {
-            mem = (char *)malloc( strlen( tok ) );
-            strncpy( mem, tok, strlen( tok ) - 1 );
-            mem[ strlen( tok ) - 1 ] = '\0';
+    snprintf( server->addr, sizeof(server->addr), "%s", tok );
 
-            errno = 0;
-            server.memory = strtol( mem, &endptr, 10 );
-            if ( errno == ERANGE || endptr == mem )
-            {
-                strcpy( k_error, "Invalid memory value" );
-                server.memory = 0;
-            }
+    tok = strtok_r( NULL, delim, &saveptr );
 
-            free( mem );
+    /* We do not check for a NULL return earlier because strtok will
+     * always return at least the first token; hence never return NULL.
+     */
+    if ( tok == NULL ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: Unable to find delimiter.\n" );
+        syslog1( LOG_INFO, k_error );
+        server->memory = 0;
+    } else {
+        errno = 0;
+        server->memory = strtol( tok, &endptr, 10 );
+        if ( errno == ERANGE || endptr == tok ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: Invalid memory value.\n" );
+            syslog1( LOG_INFO, k_error );
+            server->memory = 0;
         }
     }
-
-    return server;
 }
 
 
@@ -264,68 +389,300 @@ read_server_line( char* line )
   * \param memory The value of this pointer will be set to the total amount of allocated memory across all servers.
   * \return A serverinfo array, containing all servers that could be parsed from the given file. */
 static serverinfo*
-read_server_definitions( char* filename, unsigned int* count, unsigned long* memory )
+read_server_definitions( char* filename, int* count, unsigned long* memory )
 {
-    serverinfo* slist = 0;
+    serverinfo* slist = NULL;
     unsigned int lineno = 0;
-    unsigned int numservers = 0;
+    int numservers = 0;
     unsigned long memtotal = 0;
+    serverinfo server;
 
     FILE* fi = fopen( filename, "r" );
     while ( fi && !feof( fi ) )
     {
-        char sline[128] = "";
+        char sline[128];
 
-        if (fgets( sline, 127, fi ) == NULL)
-            continue;
-
+        char* line = fgets( sline, sizeof(sline), fi );
+        if (line == NULL) {
+            break;
+        }
         lineno++;
 
         if ( strlen( sline ) < 2 || sline[0] == '#' )
             continue;
 
-        serverinfo server = read_server_line( sline );
-        if ( server.memory > 0 && strlen( server.addr ) )
-        {
+        read_server_line( sline, &server );
+        if ( server.memory > 0 && strlen( server.addr ) > 0 ) {
             slist = (serverinfo*)realloc( slist, sizeof( serverinfo ) * ( numservers + 1 ) );
             memcpy( &slist[numservers], &server, sizeof( serverinfo ) );
             numservers++;
             memtotal += server.memory;
-        }
-        else
-        {
-            /* This kind of tells the parent code that
-             * "there were servers but not really"
-             */
+        } else {
+            // This kind of tells the parent code that "there were servers but not really"
             *count = 1;
             free( slist );
-            sprintf( k_error, "%s (line %d in %s)",
-                k_error, lineno, filename );
+            snprintf( k_error, sizeof(k_error), "Ketama: Server %s with memory %lu could not be loaded.\n", server.addr, server.memory );
+            syslog1( LOG_INFO, k_error );
+            if (fi != NULL) {
+                fclose( fi );
+            }
             return 0;
         }
     }
 
-    if ( !fi )
-    {
-        sprintf( k_error, "File %s doesn't exist!", filename );
+    if ( !fi ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: File %s doesn't exist!", filename );
+        syslog1( LOG_INFO, k_error );
 
         *count = 0;
         return 0;
-    }
-    else
-    {
+    } else {
         fclose( fi );
     }
+
+    // sort the server list
+    qsort( (void *) slist, numservers, sizeof( serverinfo ), (compfn)serverinfo_compare );
 
     *count = numservers;
     *memory = memtotal;
     return slist;
 }
 
+/** \brief Adds a server to the continuum struct
+  * \param addr The address of the server that you want to add.
+  * \param newmemory The amount of allocated memory from this server to be added to the cluster
+  * \param cont Pointer to the continuum which we will refresh. 
+  * \param count The value of this pointer will be set to the amount of servers which could be parsed.
+  * \param memory The value of this pointer will be set to the total amount of allocated memory across all servers.
+  * \param newslist Pointer to an uninitialized serverinfo pointer that will be allocated in this function (if the server isn't found) and passed back by reference
+  * \return 0 on failure, 1 on success. */
+int
+add_serverinfo( char* addr, unsigned long newmemory, continuum* cont, int* count, unsigned long* memory, serverinfo **newslist)
+{
+    int i, numservers, indx = -1;
+    unsigned long memtotal;
+    serverinfo newserver;
+    newserver.memory = 0;
+
+    // get the current number of servers and available total memory
+    numservers = cont->numservers;
+    memtotal = cont->memtotal;
+
+    // search for the server to make sure we don't add duplicates
+    for (i = 0; i < numservers; i++) {
+        if (strcmp(addr, cont->slist[i].addr) == 0) {
+            indx = i;
+        }
+    }
+
+    if (indx != -1) {
+        return 0;
+    }
+
+    // populate the new server struct
+    snprintf( newserver.addr, sizeof(newserver.addr), "%s", addr );
+    newserver.memory = newmemory;
+
+    // add the server to the list
+    *newslist = (serverinfo*) malloc( sizeof( serverinfo ) * ( numservers + 1 ) );
+    for (i = 0; i < numservers; i++) {
+        memcpy( &(*newslist)[i], &cont->slist[i], sizeof(serverinfo) );
+    }
+    memcpy( &(*newslist)[numservers], &newserver, sizeof(serverinfo) );
+    numservers++;
+    memtotal += newmemory;
+
+    // sort the server list
+    qsort( (void *) *newslist, numservers, sizeof( serverinfo ), (compfn)serverinfo_compare );
+
+    snprintf( k_error, sizeof(k_error), "Ketama: %s was added.\n", addr);
+    syslog1( LOG_INFO, k_error );
+
+    *count = numservers;
+    *memory = memtotal;
+
+    return 1;
+}
+
+/** \brief Populates global info information about the ketama continuum in json format
+ *  \param cont Pointer to the continuum resource*/
+char*
+ketama_info(ketama_continuum cont)
+{
+    int i, m = 0;
+    int bytes_avail = sizeof k_info;
+    char *ptr = k_info;
+
+    //clear current k_info
+    *k_info = '\0';
+    //write ketama information
+    snprintf(ptr, bytes_avail, "%s%i%s%i%s%s%s%i%s%i%s%i%s", 
+	"{\"ketama_info\":{\"version\":", 
+	cont->data->cont_version, ",\"mod_time\":", cont->data->cont_modtime,",\"file_name\":\"", 
+	cont->data->cont_filename,"\",\"num_points\":", cont->data->numpoints,",\"num_servers\":",
+	cont->data->numservers,",\"mem_total\":", 
+	cont->data->memtotal, ",\"server_list\":[");
+
+    m = strlen(ptr);
+    ptr += m;
+    bytes_avail -= m;
+
+    //append the list of servers in this ketama
+    for (i = 0; i < cont->data->numservers; i++) {
+        snprintf(ptr, bytes_avail, 
+           "%s%s%s%i%s", "{\"server\":\"", 
+	   cont->data->slist[i].addr,"\",\"mem\":", cont->data->slist[i].memory,"}");
+        //append a comma to the end of servers list json if there are more servers
+        if( i != cont->data->numservers - 1) {
+           m = strlen(ptr);
+           ptr += m;
+           bytes_avail -= m;
+           snprintf(ptr, bytes_avail, ",");
+	}
+        m = strlen(ptr);
+        ptr += m;
+        bytes_avail -= m;
+    }
+    //finish off json string
+    snprintf(ptr, bytes_avail, "]}}");
+
+    m = strlen(ptr);
+    ptr += m;
+    bytes_avail -= m;
+
+    //if we have no more bytes available we might have run out of k_info space
+    if ( bytes_avail == 0) {
+        sprintf(k_info, "%s", "{\"Error\" : \"Serverlist buffer is not big enough\"}");
+	return k_info;
+    }
+
+    return k_info;
+}
+
+/** \brief Syncronizes ketama ring based on the list of node names given
+ *  \param node_names comma separate list of node names that ketama should have
+ *  \param cont Pointer to the continuum which will be syncronized
+ *  \return 0 on failure and 1 on success*/
+int
+sync_servers(char* node_names, ketama_continuum cont) {
+    char * addr;
+    //pointers for strtok_r so that we can tokenize the string twice
+    char *saveptr1, *saveptr2;
+    unsigned long memory;
+    char *nodes = strdup(node_names);
+    char *node_name_token = strtok_r(nodes, ",", &saveptr1);
+    int found_node;
+    int i;
+    //loop over given nodes and check if there are any new servers to be added
+    while(node_name_token) {
+        found_node = 0;
+        //split node names into name and memory
+        char * node_name = strtok_r(node_name_token, ":", &saveptr2);
+        char * mem = strtok_r(NULL, ":", &saveptr2);
+        if (!mem) {
+            syslog1( LOG_DEBUG, "Ketama: Incorrect node format, should be name:memory\n" );
+            return 0;
+        }
+        memory = strtol(mem, NULL, 10);
+        //server add operation is idempotent
+        ketama_add_server(node_name_token, memory, cont);
+
+        //next token
+        node_name_token = strtok_r(NULL, ",",&saveptr1);
+    }
+    saveptr1 = 0;
+    saveptr2 = 0;
+    //check if we need to remove servers
+    for (i = 0; i < cont->data->numservers; i++) {
+        addr = cont->data->slist[i].addr;
+        memory = cont->data->slist[i].memory;
+        nodes = strdup(node_names);
+        node_name_token = strtok_r(nodes, ",", &saveptr1);
+        found_node = 0;
+        //loop over given nodes and check if there are any differences in ketama ring
+        while(node_name_token) {
+            char * node_name = strtok_r(node_name_token, ":", &saveptr2);
+            char * mem = strtok_r(NULL, ":", &saveptr2);
+            if (!mem) {
+                syslog1(LOG_DEBUG, "Incorrect node format, should be name:memory\n");
+                return 0;
+            }
+
+            if (strcmp(addr, node_name) == 0) {
+                found_node = 1;
+                break;
+            }
+            node_name_token = strtok_r(NULL, ",", &saveptr1);
+        }
+        if (!found_node) {
+           snprintf( k_error, sizeof(k_error), "Existing node not found, removing: %s\n", addr);
+           syslog1( LOG_INFO, k_error );
+           ketama_remove_server(addr, cont);
+           //have to step back because the element was removed
+           i--;
+        }
+    }
+    free(nodes);
+    return 1;
+}
+
+/** \brief Removes a server from the continuum struct
+  * \param addr The address of the server that you want to remove.
+  * \param cont Pointer to the continuum which we will refresh. 
+  * \param count The value of this pointer will be set to the amount of servers which could be parsed.
+  * \param memory The value of this pointer will be set to the total amount of allocated memory across all servers.
+  * \param newslist Pointer to an uninitialized serverinfo pointer that will be allocated in this function (if the server is found) and passed back by reference
+  * \return 0 on failure, 1 on success. */
+int
+remove_serverinfo( char* addr, continuum* cont, int* count, unsigned long* memory, serverinfo **newslist)
+{
+    int i, j, numservers, rm_indx = -1;
+    unsigned long memtotal, oldmemory = 0;
+
+    // get the current number of servers and available total memory
+    numservers = cont->numservers;
+    memtotal = cont->memtotal;
+    
+    for (i = 0; i < numservers; i++) {
+        if (strcmp(addr, cont->slist[i].addr) == 0) {
+            rm_indx = i;
+        }
+    }
+    // if we didn't find the server, don't remove anything and throw a warning
+    if (rm_indx == -1) {
+        return 0;
+    }
+
+    *newslist = (serverinfo*) malloc( sizeof( serverinfo ) * ( numservers - 1 ) );
+    for (i = 0, j = 0; i < numservers; i++) {
+        if (i != rm_indx) {
+            memcpy( &(*newslist)[j], &cont->slist[i], sizeof(serverinfo) );
+            j++;
+        } else {
+            oldmemory = cont->slist[i].memory;
+        }
+    }
+    numservers--;
+    memtotal -= oldmemory;
+
+    // sort the server list
+    qsort( (void *) *newslist, numservers, sizeof( serverinfo ), (compfn)serverinfo_compare );
+    snprintf( k_error, sizeof(k_error), "Ketama: %s was removed.\n", addr);
+    syslog1( LOG_INFO, k_error );
+
+    *count = numservers;
+    *memory = memtotal;
+
+    return 1;
+}
+
 
 unsigned int
 ketama_hashi( char* inString )
 {
+#if defined(ENABLE_FNV_HASH)
+    return fnv_32a_str( inString, FNV1_32_INIT );
+#else
     unsigned char digest[16];
 
     ketama_md5_digest( inString, digest );
@@ -333,6 +690,7 @@ ketama_hashi( char* inString )
                         | ( digest[2] << 16 )
                         | ( digest[1] <<  8 )
                         |   digest[0] );
+#endif
 }
 
 
@@ -340,287 +698,651 @@ mcs*
 ketama_get_server( char* key, ketama_continuum cont )
 {
     unsigned int h = ketama_hashi( key );
-    int highp = cont->numpoints;
-    mcs (*mcsarr)[cont->numpoints] = cont->array;
-    int lowp = 0, midp;
+    int lowp = 0, midp, highp;
     unsigned int midval, midval1;
+
+    // verify that a valid resource was passed in before getting its key
+    if (cont == NULL) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_get_server passed illegal pointer to a continuum resource.\n" );
+        syslog1( LOG_INFO, k_error );
+        return NULL;
+    }
+    key_t fkey = cont->key;
+
+    // try to find an existsing resource with a shared memory segment in the array of tracked resources, or create a new attachment resource
+    if ( !get_shm_resource(fkey, cont) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_get_server failed to get a valid resource.\n" );
+        syslog1( LOG_INFO, k_error  );
+        return NULL;
+    }
 
     // divide and conquer array search to find server with next biggest
     // point after what this key hashes to
-    while ( 1 )
-    {
-        midp = (int)( ( lowp+highp ) / 2 );
+    highp = cont->data->numpoints;
+    while ( 1 ) {
+        midp = ( lowp+highp ) >> 1;
 
-        if ( midp == cont->numpoints )
-            return &( (*mcsarr)[0] ); // if at the end, roll back to zeroth
+        if ( midp == cont->data->numpoints )
+            return &cont->data->array[0]; // if at the end, roll back to zeroth
 
-        midval = (*mcsarr)[midp].point;
-        midval1 = midp == 0 ? 0 : (*mcsarr)[midp-1].point;
+        midval = cont->data->array[midp].point;
+        midval1 = midp == 0 ? 0 : cont->data->array[midp-1].point;
 
         if ( h <= midval && h > midval1 )
-            return &( (*mcsarr)[midp] );
+            return &cont->data->array[midp];
 
         if ( midval < h )
-            lowp = midp + 1;
+            lowp = ++midp;
         else
-            highp = midp - 1;
+            highp = --midp;
 
         if ( lowp > highp )
-            return &( (*mcsarr)[0] );
+            return &cont->data->array[0];
     }
 }
+
+int
+ketama_get_server_count( ketama_continuum cont )
+{
+    // verify that a valid resource was passed in before getting its key
+    if (cont == NULL) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_get_server_count passed illegal pointer to a continuum resource.\n" );
+        syslog1( LOG_INFO, k_error );
+        return -1;
+    }
+    key_t key = cont->key;
+
+    // try to find an existsing resource with a shared memory segment in the array of tracked resources, or create a new attachment resource
+    if ( !get_shm_resource(key, cont) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_get_server_count failed to get a valid resource.\n" );
+        syslog1( LOG_INFO, k_error  );
+        return -1;
+    }
+
+    return cont->data->numservers;
+}
+
+/** \brief Loads the continuum of servers (each server as many points on a circle).
+  * \param key Shared memory key for storing the newly created continuum.
+  * \param slist The address of the list of servers that your building the continuum from.
+  * \param numservers Number of servers available
+  * \param memory Amount of memory available accross all servers
+  * \param fmodtime File modtime
+  * \return 0 on failure, 1 on success. */
+int
+load_continuum(key_t key, serverinfo* slist, int numservers, unsigned long memory, time_t fmodtime)
+{
+    int maxpoints = POINTS_PER_SERVER * numservers; // maximum number of ring points (HASH_COUNT * POINTS_PER_HASH * numservers)
+
+    // Continuum will hold one mcs for each point on the circle:
+    mcs *ring = (mcs*) malloc( maxpoints * sizeof(mcs) );
+    int i, k, numpoints = 0;
+
+    // buildup the continuum ring
+    for( i = 0; i < numservers; i++ )
+    {
+        float ratio = (float) slist[i].memory / (float)memory; // ratio of hashes for this server to total hashes
+        int numhashes = floorf( ratio * HASH_COUNT * (float)numservers ); // number of hashes for this server
+#ifdef DEBUG
+        int percent = floorf( ratio * 100.0 ); // percent of total hashes linked to this sever
+        syslog( LOG_INFO, "Ketama: Server no. %d: %s (mem: %lu = %u%% or %d of %d)\n",
+            i, slist[i].addr, slist[i].memory, percent, numhashes * POINTS_PER_HASH, HASH_COUNT * numservers * POINTS_PER_HASH );
+#endif
+
+#if defined(ENABLE_FNV_HASH)
+        Fnv32_t hval = FNV1_32_INIT;
+#endif
+
+        // create the points on the ring for this server
+        for( k = 0; k < numhashes; k++ )
+        {
+#if defined(ENABLE_FNV_HASH)
+            hval = fnv_32a_str(slist[i].addr, hval);
+            ring[numpoints].point = hval;
+            snprintf( ring[numpoints].ip, sizeof(ring[numpoints].ip), "%s", slist[i].addr);
+            numpoints++;
+#else
+            char ss[30];
+            unsigned char digest[16];
+
+            snprintf( ss, sizeof(ss), "%s-%d", slist[i].addr, k );
+            ketama_md5_digest( ss, digest );
+
+            // Use successive 4-bytes from hash as numbers for the points on the circle:
+            int h;
+            for( h = 0; h < POINTS_PER_HASH; h++ )
+            {
+                ring[numpoints].point = ( digest[3+h*4] << 24 )
+                                      | ( digest[2+h*4] << 16 )
+                                      | ( digest[1+h*4] <<  8 )
+                                      |   digest[h*4];
+
+                snprintf( ring[numpoints].ip, sizeof(ring[numpoints].ip), "%s", slist[i].addr);
+                numpoints++;
+                if (numpoints > maxpoints) {
+                    snprintf( k_error, sizeof(k_error), "Ketama: load_continuum tried to exceed mcs array bounds.\n" );
+                    syslog1( LOG_INFO, k_error );
+                    free(ring);
+                    free(slist);
+                    return 0;
+                }
+            }
+#endif
+        }
+    }
+
+    return reconstruct_continuum(key, slist, numservers, ring, numpoints, memory, fmodtime);
+}
+
+/** \brief Purges the continuum of the points on the circle for a specified server
+  * \param addr The address of the server that you want to remove points linked to.
+  * \param cont Pointer to the continuum which we will refresh. 
+  * \param key Shared memory key for storing the newly created continuum.
+  * \param slist The address of the list of servers that your building the continuum from.
+  * \param numservers Number of servers available
+  * \param memory Amount of memory available accross all servers
+  * \param fmodtime File modtime
+  * \return 0 on failure, 1 on success. */
+int
+remove_server_from_continuum(char* addr, continuum* cont, key_t key, serverinfo* slist, int numservers, unsigned long memory, time_t fmodtime)
+{
+    int maxpoints = POINTS_PER_SERVER * numservers; // maximum number of ring points (HASH_COUNT * POINTS_PER_HASH * numservers)
+    int allpoints = cont->numpoints; // total number of points in the ring prior to server removal
+
+    // Continuum will hold one mcs for each point on the circle:
+    mcs *ring = (mcs*) malloc( allpoints * sizeof(mcs) );
+    int i, k, numpoints = 0;
+
+    // buildup the new continuum ring
+    for( i = 0; i < allpoints; i++ )
+    {
+        // if this point is not linked to the server to purge, add it to the new ring
+        if (strcmp(addr, cont->array[i].ip) != 0) {
+            memcpy( &ring[numpoints], &cont->array[i], sizeof(mcs) );
+            numpoints++;
+            if (numpoints > maxpoints) {
+                snprintf( k_error, sizeof(k_error), "Ketama: remove_server_from_continuum tried to exceed mcs array bounds.\n" );
+                syslog1( LOG_INFO, k_error );
+                free(ring);
+                free(slist);
+                return 0;
+            }
+        }
+    }
+
+    return reconstruct_continuum(key, slist, numservers, ring, numpoints, memory, fmodtime);
+}
+
+/** \brief Adds a specified server to the continuum that has just been added to the server list
+  * \param addr The address of the server that you want to add points for.
+  * \param newmemory The amount of allocated memory from the new server to be added to the cluster
+  * \param cont Pointer to the continuum which we will refresh. 
+  * \param key Shared memory key for storing the newly created continuum.
+  * \param slist The address of the list of servers that your building the continuum from.
+  * \param numservers Number of servers available
+  * \param memory Amount of memory available accross all servers
+  * \param fmodtime File modtime
+  * \return 0 on failure, 1 on success. */
+int
+add_server_to_continuum(char* addr, unsigned long newmemory, continuum* cont, key_t key, serverinfo* slist, int numservers, unsigned long memory, time_t fmodtime)
+{
+    int maxpoints = POINTS_PER_SERVER * numservers; // maximum number of ring points (HASH_COUNT * POINTS_PER_HASH * numservers)
+    int numoldpoints = cont->numpoints; // total number of points in the ring prior to adding the server
+
+    // Continuum will hold one mcs for each point on the circle:
+    mcs *ring = (mcs*) malloc( maxpoints * sizeof(mcs) );
+    int i, k, indx = -1, numpoints = 0;
+
+    // determine the number of hashes to create
+    float ratio = (float)newmemory / (float)memory; // ratio of hashes for this server to total hashes
+    int numhashes = floorf( ratio * HASH_COUNT * (float)numservers ); // number of hashes for this server
+    //given unevenly distributed memory we need to limit number of hashes
+    int max_hashcount = POINTS_PER_SERVER / POINTS_PER_HASH;
+    if (numhashes > max_hashcount) {
+	numhashes = max_hashcount;
+    }
+#ifdef DEBUG
+    int percent = floorf( ratio * 100.0 ); // percent of total hashes linked to this sever
+    syslog( LOG_INFO, "Ketama: Server no. %d: %s (mem: %lu = %u%% or %d of %d)\n",
+        i, addr, newmemory, percent, numhashes * POINTS_PER_HASH, HASH_COUNT * numservers * POINTS_PER_HASH );
+#endif
+
+#if defined(ENABLE_FNV_HASH)
+    Fnv32_t hval = FNV1_32_INIT;
+#endif
+
+    // create the points on the ring for the new server
+    for( k = 0; k < numhashes; k++ )
+    {
+#if defined(ENABLE_FNV_HASH)
+        hval = fnv_32a_str(addr, hval);
+        ring[numpoints].point = hval;
+        snprintf( ring[numpoints].ip, sizeof(ring[numpoints].ip), "%s", addr);
+        numpoints++;
+        if (numpoints > maxpoints) {
+       	   snprintf( k_error, sizeof(k_error), "Ketama: add_server_to_continuum tried to exceed mcs array bounds.\n" );
+           syslog1( LOG_INFO, k_error );
+           free(ring);
+           free(slist);
+           return 0;
+        }
+#else
+        char ss[30];
+        unsigned char digest[16];
+
+        snprintf( ss, sizeof(ss), "%s-%d", addr, k );
+        ketama_md5_digest( ss, digest );
+
+        // Use successive 4-bytes from hash as numbers for the points on the circle:
+        int h;
+        for( h = 0; h < POINTS_PER_HASH; h++ )
+        {
+            ring[numpoints].point = ( digest[3+h*4] << 24 )
+                                  | ( digest[2+h*4] << 16 )
+                                  | ( digest[1+h*4] <<  8 )
+                                  |   digest[h*4];
+
+            snprintf( ring[numpoints].ip, sizeof(ring[numpoints].ip), "%s", addr);
+            numpoints++;
+            if (numpoints > maxpoints) {
+                snprintf( k_error, sizeof(k_error), "Ketama: add_server_to_continuum tried to exceed mcs array bounds.\n" );
+                syslog1( LOG_INFO, k_error );
+                free(ring);
+                free(slist);
+                return 0;
+            }
+        }
+#endif
+    }
+    
+    // append the points on the current ring (will be sorted in the reconstruction phase)
+    for( i = 0; i < numoldpoints; i++ )
+    {
+        memcpy( &ring[numpoints], &cont->array[i], sizeof(mcs) );
+        numpoints++;
+        if (numpoints > maxpoints) {
+            snprintf( k_error, sizeof(k_error), "Ketama: add_server_to_continuum tried to exceed mcs array bounds.\n" );
+            syslog1( LOG_INFO, k_error );
+            free(ring);
+            free(slist);
+            return 0;
+        }
+    }
+
+    // reconstruct the continuum
+    return reconstruct_continuum(key, slist, numservers, ring, numpoints, memory, fmodtime);
+}
+
+int
+reconstruct_continuum(key_t key, serverinfo* slist, int numservers, mcs* ring, int numpoints, unsigned long memory, time_t fmodtime) {
+    int shmid, sem_set_id;
+    continuum* data;  // Pointer to shmem location
+
+    // sort the ring in ascending order of "point"
+    qsort( (void*) ring, numpoints, sizeof( mcs ), (compfn)ketama_compare );
+
+    // attempt to obtain the shared memory ID assigned to this key, and create a segment if it doesn't exist
+    shmid = shmget( key, MC_SHMSIZE, 0644 | IPC_CREAT );
+    if ( shmid == -1 ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: reconstruct_continuum failed to get valid shared memory segment with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error );
+        return 0;
+    }
+
+    // lock the semaphore to prevent other writing to the shared memory segment
+    sem_set_id = ketama_sem_init( key );
+    ketama_sem_safely_lock( sem_set_id );
+    int invalid_write = 0;
+
+    // create an attachment in virtual memory to the shared memory segment, and failout if that an error is returned
+    data = (continuum*) shmat( shmid, (void *)0, 0 );
+    if ( data == (void *)(-1) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: reconstruct_continuum failed to attach writable shared memory segment with errno: %d.\n", errno );
+        invalid_write = 1;
+    }
+
+    // verify that the mcs array can hold this many points
+    if ( sizeof(data->array) < sizeof(mcs) * numpoints ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: reconstruct_continuum tried to exceed size of mcs array.\n" );
+        ketama_shmdt(data);
+        invalid_write = 1;
+    }
+
+    // verify that the serverinfo array can hold this many servers
+    if ( sizeof(data->slist) < sizeof(serverinfo) * numservers ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: reconstruct_continuum tried to exceed size of servers array.\n" );
+        ketama_shmdt(data);
+        invalid_write = 1;
+    }
+
+    // gracefully failout if any of the preceeding checks discovered errors
+    if (invalid_write) {
+        syslog1( LOG_INFO, k_error );
+        free(ring);
+        free(slist);
+        ketama_sem_unlock( sem_set_id );
+        return 0;
+    }
+
+    // record the new data into the shared memory segment
+    data->numpoints = numpoints;
+    data->numservers = numservers;
+    data->memtotal = memory;
+    data->fmodtime = fmodtime;
+    memcpy( data->array, ring, sizeof( mcs ) * numpoints );
+    memcpy( data->slist, slist, sizeof( serverinfo ) * numservers );
+    syslog( LOG_INFO, "Ketama: copied mcs array into %p from %p and slist into %p from %p.\n", data->array, ring, data->slist, slist );
+
+    data->cont_version++;
+    data->cont_modtime = time(NULL);
+
+    // We detatch here because we will re-attach in read-only mode to actually use it.
+    if (ketama_shmdt(data) == -1) {
+        snprintf( k_error, sizeof(k_error), "Ketama: reconstruct_continuum failed to detatch from shared memory with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error );
+    }
+    // unlock the semaphore
+    ketama_sem_unlock( sem_set_id );
+
+    // clean up
+    free(ring);
+    free(slist);
+
+    return 1;
+}
+
+/** \brief Rolls the ketama, or checks for propper creation based on passed in flag
+  * \param contptr The value of this pointer will contain the retrieved continuum.
+  * \param filename The server-definition file which defines our continuum.
+  * \param roller_flag 0 to allow creation if continuum is stale or non-existent, 
+  *                    1 to only allow a check for a valid continuum
+  * \return 0 on failure, 1 on success. */
+static int ketama_roller( ketama_continuum* contptr, char* filename, int roller_flag );
+// need this declared here, but it will be defined later on
 
 
 /** \brief Generates the continuum of servers (each server as many points on a circle).
   * \param key Shared memory key for storing the newly created continuum.
   * \param filename Server definition file, which will be parsed to create this continuum.
+  * \param contptr The value of this pointer will contain the retrieved continuum resource.
   * \return 0 on failure, 1 on success. */
 static int
-ketama_create_continuum( key_t key, char* filename )
+ketama_create_continuum(key_t key, char* filename, ketama_continuum* contptr)
 {
-    if (shm_ids == NULL) {
-        init_shm_id_tracker();
-    }
-
-    if (shm_data == NULL) {
-        init_shm_data_tracker();
-    }
-
-    int shmid;
-    int* data;  /* Pointer to shmem location */
-    unsigned int numservers = 0;
+    int shmid, sem_set_id;
+    int numservers = 0;
     unsigned long memory;
     serverinfo* slist;
+    continuum* data;
 
-    slist = read_server_definitions( filename, &numservers, &memory );
-    /* Check numservers first; if it is zero then there is no error message
-     * and we need to set one. */
-    if ( numservers < 1 )
-    {
-        sprintf( k_error, "No valid server definitions in file %s", filename );
-        return 0;
-    }
-    else if ( slist == 0 )
-    {
-        /* read_server_definitions must've set error message. */
-        return 0;
-    }
-#ifdef DEBUG
-     syslog( LOG_INFO, "Server definitions read: %u servers, total memory: %lu.\n",
-        numservers, memory );
-#endif
+    // if filename is not a user-specific key, init a shared memory segment from the pathname, if it's valid
+    if (strncmp(filename, "key:", 4) != 0) {
+        // get the list of servers from the provided file
+        slist = read_server_definitions( filename, &numservers, &memory );
 
-    /* Continuum will hold one mcs for each point on the circle: */
-    mcs continuum[ numservers * 160 ];
-    unsigned int i, k, cont = 0;
+        // Check numservers first; if it is zero then there is no error message and we need to set one.
+        if ( numservers < 1 ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: No valid server definitions in file %s", filename );
+            syslog1( LOG_INFO, k_error );
+            return 0;
+        } else if ( slist == NULL ) {
+            // read_server_definitions must've set error message.
+            return 0;
+        }
 
-    for( i = 0; i < numservers; i++ )
-    {
-        float pct = (float)slist[i].memory / (float)memory;
-        unsigned int ks = floorf( pct * 40.0 * (float)numservers );
-#ifdef DEBUG
-        int hpct = floorf( pct * 100.0 );
+        // log the sucessful file read
+        syslog( LOG_INFO, "Ketama: Server definitions read: %u servers, total memory: %lu.\n", numservers, memory );
 
-        syslog( LOG_INFO, "Server no. %d: %s (mem: %lu = %u%% or %d of %d)\n",
-            i, slist[i].addr, slist[i].memory, hpct, ks, numservers * 40 );
-#endif
+        time_t fmodtime = file_modtime( filename );
 
-        for( k = 0; k < ks; k++ )
-        {
-            /* 40 hashes, 4 numbers per hash = 160 points per server */
-            char ss[30];
-            unsigned char digest[16];
-
-            sprintf( ss, "%s-%d", slist[i].addr, k );
-            ketama_md5_digest( ss, digest );
-
-            /* Use successive 4-bytes from hash as numbers
-             * for the points on the circle: */
-            int h;
-            for( h = 0; h < 4; h++ )
-            {
-                continuum[cont].point = ( digest[3+h*4] << 24 )
-                                      | ( digest[2+h*4] << 16 )
-                                      | ( digest[1+h*4] <<  8 )
-                                      |   digest[h*4];
-
-                memcpy( continuum[cont].ip, slist[i].addr, 22 );
-                cont++;
-            }
+        // attempt to load the continuum and log an error if this fails
+        if ( !load_continuum( key, slist, numservers, memory, fmodtime ) ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: ketama_create_continuum failed to load the continuum.\n" );
+            syslog1( LOG_INFO, k_error );
+            return 0;
         }
     }
-    free( slist );
 
-    /* Sorts in ascending order of "point" */
-    qsort( (void*) &continuum, cont, sizeof( mcs ), (compfn)ketama_compare );
-
-    /* Add data to shmmem */
+    // attempt to obtain the shared memory ID assigned to this key, and create a segment if it doesn't exist
     shmid = shmget( key, MC_SHMSIZE, 0644 | IPC_CREAT );
-    track_shm_id(shmid);
-
-	data = shmat( shmid, (void *)0, 0 );
-    if ( data == (void *)(-1) )
-    {
-        strcpy( k_error, "Can't open shmmem for writing." );
+    if ( shmid == -1 ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_create_continuum failed to get valid shared memory segment with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error );
         return 0;
     }
 
-    time_t modtime = file_modtime( filename );
-    int nump = cont;
-    memcpy( data, &nump, sizeof( int ) );
-    memcpy( data + 1, &modtime, sizeof( time_t ) );
-    memcpy( data + 1 + sizeof( void* ), &continuum, sizeof( mcs ) * nump );
+    // lock the semaphore to prevent other writing to the shared memory segment
+    sem_set_id = ketama_sem_init( key );
+    ketama_sem_safely_lock( sem_set_id );
 
-    /* We detatch here because we will re-attach in read-only
-     * mode to actually use it. */
-#ifdef SOLARIS
-    if ( shmdt( (char *) data ) == -1 )
-#else
-    if ( shmdt( data ) == -1 )
-#endif
-        strcpy( k_error, "Error detatching from shared memory!" );
+    // create an attachment in virtual memory to the shared memory segment, and failout if that an error is returned
+    data = (continuum*) shmat( shmid, (void *)0, 0 );
+    if ( data == (void *)(-1) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_create_continuum failed to attach writable shared memory segment with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error  );
+        ketama_sem_unlock( sem_set_id );
+        return 0;
+    }
 
-    return 1;
+    // if filename is not a path, init an empty shared memory segment, otherwise just record the filename
+    if (strncmp(filename, "key:", 4) == 0) {
+        data->fmodtime = 0;
+        data->cont_version = 1;
+        data->cont_modtime = time(NULL);
+    }
+    snprintf(data->cont_filename, sizeof(data->cont_filename), "%s", filename);
+
+    // attempt to detach the shared memory segment and throw an error if one is received
+    if (ketama_shmdt(data) == -1) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_create_continuum failed to detatch from shared memory with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error );
+    }
+
+    // unlock the semaphore
+    ketama_sem_unlock( sem_set_id );
+
+    // rerun ketama_roller with the roller flag on to validate the loaded continuum
+    return ketama_roller( contptr, filename, 1);
 }
 
+int
+ketama_add_server( char* addr, unsigned long newmemory, ketama_continuum cont)
+{
+    key_t key;
+    int numservers = 0;
+    unsigned long memory;
+    serverinfo* slist;
+    time_t fmodtime;
+
+    // verify that a valid resource was passed in before getting its key
+    if (cont == NULL) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_add_server passed illegal pointer to a continuum resource.\n" );
+        syslog1( LOG_INFO, k_error );
+        return 0;
+    }
+    key = cont->key;
+
+    // try to find an existsing resource with a shared memory segment in the array of tracked resources, or create a new attachment resource
+    if ( !get_shm_resource(key, cont) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_add_server failed to get a valid resource.\n" );
+        syslog1( LOG_INFO, k_error  );
+        return 0;
+    }
+
+    // get the new server list
+    if (add_serverinfo( addr, newmemory, cont->data, &numservers, &memory, &slist)) {
+        // get the shared memory segment key
+        key = get_key( cont->data->cont_filename, &fmodtime );
+        if ( key == -1 ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: ketama_add_server failed to make a valid key from %s.\n", cont->data->cont_filename );
+            syslog1( LOG_INFO, k_error );
+            return 0;
+        }
+
+        // attempt to load the continuum
+        if ( !add_server_to_continuum( addr, newmemory, cont->data, key, slist, numservers, memory, fmodtime ) ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: ketama_add_server failed to add the server to the continuum.\n" );
+            syslog1( LOG_INFO, k_error );
+            return 0;
+        }
+    } else {
+        snprintf( k_error, sizeof(k_error), "Ketama: %s is already in the server list and was not added.\n", addr);
+        syslog1( LOG_INFO, k_error );
+    }
+
+    return ketama_roller( &cont, cont->data->cont_filename, 1);
+}
+
+int
+ketama_remove_server( char* addr, ketama_continuum cont)
+{
+    key_t key;
+    int numservers = 0;
+    unsigned long memory;
+    serverinfo* slist;
+    time_t fmodtime;
+
+    // verify that a valid resource was passed in before getting its key
+    if (cont == NULL) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_remove_server passed illegal pointer to a continuum resource.\n" );
+        syslog1( LOG_INFO, k_error );
+        return 0;
+    }
+    key = cont->key;
+
+    // try to find an existsing resource with a shared memory segment in the array of tracked resources, or create a new attachment resource
+    if ( !get_shm_resource(key, cont) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_remove_server failed to get a valid resource.\n" );
+        syslog1( LOG_INFO, k_error  );
+        return 0;
+    }
+
+    // get the new server list
+    if (remove_serverinfo( addr, cont->data, &numservers, &memory, &slist)) {
+        // get the shared memory segment key, validating the key that was passed in
+        key = get_key( cont->data->cont_filename, &fmodtime );
+        if ( key == -1 ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: ketama_remove_server failed to make a valid key from %s.\n", cont->data->cont_filename );
+            syslog1( LOG_INFO, k_error );
+            return 0;
+        }
+
+        // attempt to purge the continuum of points for this server
+        if ( !remove_server_from_continuum( addr, cont->data, key, slist, numservers, memory, fmodtime ) ) {
+            snprintf( k_error, sizeof(k_error), "Ketama: ketama_remove_server failed to remove the server from the continuum.\n" );
+            syslog1( LOG_INFO, k_error );
+            return 0;
+        }
+    } else {
+        snprintf( k_error, sizeof(k_error), "Ketama: %s not found and not removed.\n", addr);
+        syslog1( LOG_INFO, k_error );
+    }
+    
+    return ketama_roller( &cont, cont->data->cont_filename, 1);
+}
+
+
+static int
+ketama_roller( ketama_continuum* contptr, char* filename, int roller_flag )
+{
+    key_t key;
+    continuum_resource resource;
+
+    // if we have a string like "key:0x1234" that means we want to set up the infastructure 
+    // but leave continuum creation until we manually add servers with ketama_add_server
+    char cont_filename[PATH_MAX];
+    time_t fmodtime;
+    snprintf(cont_filename, sizeof(cont_filename), "%s", filename);
+    key = get_key(cont_filename, &fmodtime);
+    if ( key == -1 ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_roll failed to make a valid key from %s.\n", filename );
+        syslog1( LOG_INFO, k_error );
+        return 0;
+    }
+
+    // try to find an existsing resource with a shared memory segment in the array of tracked resources, or create a new attachment resource
+    if ( !get_shm_resource(key, &resource) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_roller failed to get a valid resource.\n" );
+        syslog1( LOG_INFO, k_error  );
+        return 0;
+    }
+
+    // if the continuum is not stale or new, end here and track the resource if we somehow missed tracking it
+    if ( (resource.data->fmodtime == fmodtime) && (resource.data->cont_version != 0) ) {
+        **contptr = resource;
+        track_shm_resource(resource);
+        syslog( LOG_DEBUG, "Ketama: ketama_roll() successfully found a valid shared memory segment at %p with ID: %lu and key: %lu, stored into %p.\n", 
+            resource.data, (long unsigned int) resource.shmid, (long unsigned int) resource.key, *contptr);
+        return 1;
+    }
+
+    // detach from the shared memory segment so that we can attach again in ketama_create to initialize the continuum
+    if ( ketama_shmdt(resource.data) == -1 ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_roll failed to detatch from shared memory with errno: %d.\n", errno );
+        syslog1( LOG_INFO, k_error );
+    }
+
+    // if we've already attempted to run ketama_create then that subroutine failed and we want to fail out
+    if ( roller_flag != 0) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_create_continuum failed to create a valid continuum.\n" );
+        syslog1( LOG_INFO, k_error );
+        return 0;
+    }
+
+    // attempt to run ketama_create continuum
+    if ( !ketama_create_continuum( key, filename, contptr ) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_create_continuum failed!\n" );
+        syslog1( LOG_INFO, k_error );
+        return 0;
+    }
+
+    // if we reach this point then we've created the continuum and reran ketama_roll to check its validity, so just log this and exit
+    syslog1( LOG_INFO, "Ketama: ketama_create_continuum successfully finished.\n" );
+    return 1;
+}
 
 int
 ketama_roll( ketama_continuum* contptr, char* filename )
 {
-    if (shm_ids == NULL) {
-        init_shm_id_tracker();
+    // some initialization
+    if (shm_resources == NULL) {
+        init_shm_resource_tracker();
+        syslog1( LOG_DEBUG, "Ketama: Resource tracker initiated.\n" );
     }
 
-    if (shm_data == NULL) {
-        init_shm_data_tracker();
-    }   
+    // initiate the resource pointer
+    *contptr = (ketama_continuum) malloc( sizeof(continuum_resource) );
+    syslog1( LOG_DEBUG, "Ketama: Shared memory resource initiated.\n" );
 
-    strcpy( k_error, "" );
-
-    key_t key;
-    int shmid;
-    int *data;
-    int sem_set_id;
-
-//     setlogmask( LOG_UPTO ( LOG_NOTICE | LOG_ERR | LOG_INFO ) );
-//     openlog( "ketama", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1 );
-
-    key = ftok( filename, 'R' );
-    if ( key == -1 )
-    {
-        sprintf( k_error, "Invalid filename specified: %s", filename );
-        return 0;
-    }
-
-    *contptr = malloc( sizeof( continuum ) );
-    (*contptr)->numpoints = 0;
-    (*contptr)->array = 0;
-    (*contptr)->modtime = 0;
-
-    sem_set_id = ketama_sem_init( key );
-
-    int sanity = 0;
-    while ( semctl( sem_set_id, 0, GETVAL, 0 ) == 2 )
-    {
-        // wait for the continuum creator to finish, but don't block others
-        usleep( 5 );
-
-        // if we are waiting for > 1 second, take drastic action:
-        if(++sanity > 1000000)
-	{
-            usleep( rand()%50000 );
-            ketama_sem_unlock( sem_set_id );
-	    break;
-        }
-    }
-
-    time_t modtime = file_modtime( filename );
-    time_t* fmodtime = 0;
-    while ( !fmodtime || modtime != *fmodtime )
-    {
-        shmid = shmget( key, MC_SHMSIZE, 0 ); // read only attempt.
-        track_shm_id(shmid);
-
-		data = shmat( shmid, (void *)0, SHM_RDONLY );
-
-        if ( data == (void *)(-1) || (*contptr)->modtime != 0 )
-        {
-            ketama_sem_lock( sem_set_id );
-
-//          if ( (*contptr)->modtime == 0 )
-//              syslog( LOG_INFO, "Shared memory empty, creating and populating...\n" );
-//          else
-//              syslog( LOG_INFO, "Server definitions changed, reloading...\n" );
-
-            if ( !ketama_create_continuum( key, filename ) )
-            {
-//                 strcpy( k_error, "Ketama_create_continuum() failed!" );
-                ketama_sem_unlock( sem_set_id );
-                return 0;
-            }
-/*          else
-                syslog( LOG_INFO, "ketama_create_continuum() successfully finished.\n" );*/
-
-            shmid = shmget( key, MC_SHMSIZE, 0 ); // read only attempt.
-            track_shm_id(shmid);
-
-            data = shmat( shmid, (void *)0, SHM_RDONLY );
-            ketama_sem_unlock( sem_set_id );
-        }
-
-        if ( data == (void *)(-1) )
-        {
-            strcpy( k_error, "Failed miserably to get pointer to shmemdata!" );
-            return 0;
-        }
-
-        (*contptr)->numpoints = *data;
-        (*contptr)->modtime = ++data;
-        (*contptr)->array = data + sizeof( void* );
-        fmodtime = (time_t*)( (*contptr)->modtime );
-
-        track_shm_data(data);
-    }
-
-    return 1;
+    return ketama_roller( contptr, filename, 0);
 }
 
 
+
 void
-ketama_smoke( ketama_continuum contptr )
+ketama_smoke( ketama_continuum cont )
 {
     int i;
-    if (shm_data != NULL) {
-        for (i = 0; i < num_data; i++) {
-            shmdt(shm_data[i]);
+    if (shm_resources != NULL) {
+        for (i = 0; i < num_resources; i++) {
+            ketama_shmdt(shm_resources[i].data);
         }
-        free(shm_data);
-        shm_data = NULL;
-        num_data = 0;
-        shm_data_size = 1024;
+        free(shm_resources);
+        shm_resources = NULL;
+        num_resources = 0;
+        shm_resources_size = 10;
     }
 
     if (sem_ids != NULL) {
-    	for (i = 0; i < num_sem_ids; i++) {
-            semctl(sem_ids[i], 0, IPC_RMID, 0);
-        }
         free(sem_ids);
         sem_ids = NULL;
         num_sem_ids = 0;
-        sem_ids_size = 1024;
+        sem_ids_size = 10;
     }
 
-    if (shm_ids != NULL) {
-        for (i = 0; i < num_shm_ids; i++) {
-            shmctl(shm_ids[i], IPC_RMID, 0);
-        }
-        free(shm_ids);
-        shm_ids = NULL;
-        num_shm_ids = 0;
-        shm_ids_size = 1024;
-    }
+    free(cont);
 
-    free(contptr);
+    syslog1( LOG_DEBUG, "Ketama: Ketama completely smoked.\n" );
 }
 
 
@@ -628,18 +1350,30 @@ void
 ketama_print_continuum( ketama_continuum cont )
 {
     int a;
-    printf( "Numpoints in continuum: %d\n", cont->numpoints );
+    key_t key;
 
-    if ( cont->array == 0 )
-    {
-        printf( "Continuum empty\n" );
+    // verify that a valid resource was passed in before getting its key
+    if (cont == NULL) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_print_continuum passed illegal pointer to a continuum resource.\n" );
+        syslog1( LOG_INFO, k_error );
+        return;
     }
-    else
-    {
-        mcs (*mcsarr)[cont->numpoints] = cont->array;
-        for( a = 0; a < cont->numpoints; a++ )
-        {
-            printf( "%s (%u)\n", (*mcsarr)[a].ip, (*mcsarr)[a].point );
+    key = cont->key;
+
+    // try to find an existsing resource with a shared memory segment in the array of tracked resources, or create a new attachment resource
+    if ( !get_shm_resource(key, cont) ) {
+        snprintf( k_error, sizeof(k_error), "Ketama: ketama_print_continuum failed to get a valid resource.\n" );
+        syslog1( LOG_INFO, k_error  );
+        return;
+    }
+
+    printf( "Numpoints in continuum: %d\n", cont->data->numpoints );
+
+    if ( cont->data->array == 0 ) {
+        printf( "Continuum empty\n" );
+    } else {
+        for( a = 0; a < cont->data->numpoints; a++ ) {
+            printf( "%s (%u)\n", cont->data->array[a].ip, cont->data->array[a].point );
         }
     }
 }
@@ -649,6 +1383,12 @@ int
 ketama_compare( mcs *a, mcs *b )
 {
     return ( a->point < b->point ) ?  -1 : ( ( a->point > b->point ) ? 1 : 0 );
+}
+
+int
+serverinfo_compare( serverinfo *a, serverinfo *b )
+{
+    return ( strcmp(a->addr, b->addr) );
 }
 
 

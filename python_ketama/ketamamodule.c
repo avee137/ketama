@@ -7,7 +7,7 @@
  *
  * libketama defines:
  * ketama_roll: initialize server list and return a continuum
- * ketama_destroy: free memory used by continuum
+ * ketama_smoke: free memory used by continuum
  * ketama_get_server: hash key up and return server to use from continuum
  * ketama_print_continuum: print out continuum
  * ketama_error: return current error string
@@ -94,16 +94,58 @@ PY_DEF(pyketama_Continuum_get_server, self, args) {
     return ret;
 }
 
+PY_DEF(pyketama_Continuum_get_server_count, self, args) {
+    int numservers;
+
+    numservers = ketama_get_server_count( ((pyketama_Continuum *)self)->cont );
+
+    if (numservers == -1) {
+        PyErr_SetString( pyketama_error, "unable to get the server count" );
+    }
+
+    return Py_BuildValue("i", numservers);
+}
+
+PY_DEF(pyketama_Continuum_add_server, self, args) {
+    char *address;
+    unsigned long memory;
+
+    if (PyArg_ParseTuple( args, "sl", &address, &memory )) {
+       if (!ketama_add_server( address, memory, ((pyketama_Continuum *)self)->cont )) {
+           // PyErr_SetString( pyketama_error, "unable to add a server to the Ketama continuum" );
+           return Py_BuildValue("b", 0);
+       }
+    } else {
+        return Py_BuildValue("b", 0);
+    }
+    return Py_BuildValue("b", 1);
+}
+
+PY_DEF(pyketama_Continuum_remove_server, self, args) {
+    char *address;
+
+    if (PyArg_ParseTuple( args, "s", &address )) {
+        if (!ketama_remove_server( address, ((pyketama_Continuum *)self)->cont )) {
+            PyErr_SetString( pyketama_error, "unable to remove a server from the Ketama continuum" );
+            return Py_BuildValue("b", 0);
+        }
+    } else {
+        return Py_BuildValue("b", 0);
+    }
+
+    return Py_BuildValue("b", 1);
+}
+
 PY_DEF(pyketama_Continuum_get_points, self, args) {
     PyObject *ret = NULL;
     pyketama_Continuum *pkc = (pyketama_Continuum *)self;
 
-    if (pkc->cont->array) {
+    if (pkc->cont->data->array) {
         int i;
-        mcs (*mcsarr)[pkc->cont->numpoints] = pkc->cont->array;
+        mcs (*mcsarr)[pkc->cont->data->numpoints] = &pkc->cont->data->array;
 
-        ret = PyList_New(pkc->cont->numpoints);
-        for (i = 0; i < pkc->cont->numpoints; i++) {
+        ret = PyList_New(pkc->cont->data->numpoints);
+        for (i = 0; i < pkc->cont->data->numpoints; i++) {
             PyList_SET_ITEM(ret, i,
                 Py_BuildValue("Is", (*mcsarr)[i].point, (*mcsarr)[i].ip));
         }
@@ -111,6 +153,32 @@ PY_DEF(pyketama_Continuum_get_points, self, args) {
 
     return ret;
 }
+
+PY_DEF(pyketama_Continuum_destroy, self, args) {
+    ketama_smoke(((pyketama_Continuum *) self)->cont);
+    return Py_BuildValue("b", 1);
+}
+
+PY_DEF(pyketama_Continuum_print, self, args) {
+    ketama_print_continuum(((pyketama_Continuum *) self)->cont);
+    return Py_BuildValue("b", 1);
+}
+
+PY_DEF(pyketama_Continuum_get_info, self, args) {
+    PyObject *r = NULL;
+    r = Py_BuildValue("s", ketama_info(((pyketama_Continuum *) self)->cont));
+    return r;
+}
+
+PY_DEF(pyketama_Continuum_sync_servers, self, args) {
+    PyObject *r = NULL;
+    char* servers;
+    if (PyArg_ParseTuple( args, "s", &servers )) {
+        r = Py_BuildValue("b", sync_servers(servers, ((pyketama_Continuum *) self)->cont));
+    }
+    return r;
+}
+
 
 /* }}} Continuum type definition */
 
@@ -121,6 +189,8 @@ PY_DEF(pyketama_hashi, self, args) {
     if (PyArg_ParseTuple(args, "s", &data)) {
         r = Py_BuildValue("I", ketama_hashi(data));
     }
+
+    return r;
 }
 
 PyMODINIT_FUNC initketama(void) {
